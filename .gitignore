@@ -26,3 +26,8 @@ MANIFEST
 .coverage
 coverage.xml
 htmlcov/
+truenas-receipt-uploader/venv/
+truenas-receipt-uploader/.env
+__pycache__/
+*.pyc
+monarch-receipt-uploader.zip

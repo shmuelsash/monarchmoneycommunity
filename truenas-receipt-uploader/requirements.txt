@@ -1,0 +1,3 @@
+# The receipt-inbox feature lives on PR #44's branch (not yet on PyPI), so install
+# the library straight from that branch. This pulls in aiohttp, gql==4.0, oathtool too.
+git+https://github.com/shmuelsash/monarchmoneycommunity.git@feat/upload-receipt-to-inbox
