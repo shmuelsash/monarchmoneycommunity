@@ -9,41 +9,59 @@
  * Faithfully replicates the `upload_receipt_to_inbox` flow from monarchmoneycommunity
  * PR #44: create bulk retail sync -> POST file to /retail-sync/{id}/files -> start sync.
  *
- * SETUP
- *  1) Open https://script.google.com -> New project -> paste this whole file.
- *  2) Fill in CONFIG below (email, password, and your MFA/2FA secret).
- *  3) Run `processGroceryReceipts` once and authorize Gmail + external requests.
- *  4) Optional: add a time-based trigger (Triggers -> Add Trigger ->
- *     processGroceryReceipts -> Time-driven) to run it on a schedule.
+ * AUTH = COOKIES (NOT email/password)
+ * -----------------------------------
+ * Apps Script runs on Google's servers, and Monarch's /auth/login/ endpoint is
+ * behind Cloudflare, which blocks programmatic logins from datacenter IPs
+ * (you'll get a Cloudflare "Sorry, you have been blocked" page). The fix —
+ * same as the Python library's login_with_cookies() — is to reuse your browser
+ * session cookies and skip the login endpoint entirely.
  *
- * MFA SECRET: this is the base32 "setup key" Monarch shows when you enable an
- * authenticator app (e.g. "JBSWY3DPEHPK3PXP"), NOT the rotating 6-digit code.
- * If your account has no MFA, leave it as "".
+ * HOW TO GET YOUR COOKIES + USER-AGENT
+ *   1) In Chrome, log into https://app.monarch.com.
+ *   2) Open DevTools (F12) -> Network tab.
+ *   3) Click around so a request to "api.monarch.com/graphql" appears; click it.
+ *   4) Under "Request Headers", copy the FULL value of the `cookie:` header and
+ *      paste it into CONFIG.monarchCookie below. It must contain session_id and
+ *      csrftoken (copying everything, including cf_clearance, is best).
+ *   5) From the same request, copy the `user-agent:` value into CONFIG.userAgent.
+ *
+ * Cookies expire periodically (typically weeks). When uploads start failing with
+ * 401/403, re-copy a fresh cookie string. NOTE: because cf_clearance is tied to
+ * an IP, Cloudflare may still challenge requests from Google's servers; if even
+ * the cookie approach returns a Cloudflare HTML page, this can't run from Apps
+ * Script and would need to run from a residential IP (e.g. the Python library).
+ *
+ * SETUP
+ *   1) https://script.google.com -> New project -> paste this whole file.
+ *   2) Fill in CONFIG.
+ *   3) Run `testMonarchAuth` to confirm the cookies work, then `processGroceryReceipts`.
+ *   4) Optional: add a time-based trigger for processGroceryReceipts.
  */
 
 // ===================== CONFIG =====================
 var CONFIG = {
-  email: 'YOU@example.com',
-  password: 'your-monarch-password',
-  mfaSecret: '',  // base32 authenticator setup key, or '' if MFA is off
+  // Full cookie header string from your browser (must include session_id + csrftoken).
+  monarchCookie: 'PASTE_FULL_COOKIE_STRING_HERE',
 
-  // Same search you already use. Read or unread, from these senders, from this date on.
+  // The exact User-Agent your browser sent (helps pass Cloudflare / match the session).
+  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+
+  // Same Gmail search you already use.
   searchQuery: '(from:receipts@aisleonekosher.com OR from:info@evergreenkosher.com OR from:receipts@hivediscount.com) after:2025/04/30',
 
-  // If true, the email is trashed once all its PDFs upload successfully (matches your
-  // old "delete after download" behavior). If false, emails are left in place.
+  // Trash the email once all its PDFs upload successfully (matches your old behavior).
   trashOnSuccess: true
 };
 // ==================================================
 
 var MM_BASE = 'https://api.monarch.com';
-var USER_AGENT = 'MonarchMoneyAPI (https://github.com/bradleyseanf/monarchmoneycommunity)';
 
 /**
  * Main entry point — scan Gmail and upload each receipt PDF to the Monarch inbox.
  */
 function processGroceryReceipts() {
-  var token = monarchLogin();
+  requireCookie_();
   var threads = GmailApp.search(CONFIG.searchQuery);
   var uploaded = 0, failed = 0;
 
@@ -59,13 +77,12 @@ function processGroceryReceipts() {
       for (var k = 0; k < attachments.length; k++) {
         var attachment = attachments[k];
 
-        // Only PDFs (same rule as your downloader)
         if (attachment.getContentType() === 'application/pdf' ||
             attachment.getName().toLowerCase().endsWith('.pdf')) {
           foundPdf = true;
           var blob = attachment.copyBlob().setName(attachment.getName());
           try {
-            uploadReceiptToInbox(token, blob);
+            uploadReceiptToInbox(blob);
             uploaded++;
             Logger.log('Uploaded to Monarch inbox: ' + attachment.getName());
           } catch (e) {
@@ -76,13 +93,10 @@ function processGroceryReceipts() {
         }
       }
 
-      // Rules: trash the email only if every PDF uploaded; otherwise mark unread
-      // so it stays visible and gets retried next run.
+      // Trash only if every PDF uploaded; otherwise mark unread so it retries next run.
       if (foundPdf && allUploaded && CONFIG.trashOnSuccess) {
         message.moveToTrash();
-      } else if (!foundPdf) {
-        message.markUnread();
-      } else if (!allUploaded) {
+      } else if (!foundPdf || !allUploaded) {
         message.markUnread();
       }
     }
@@ -94,16 +108,16 @@ function processGroceryReceipts() {
 /**
  * Full inbox upload flow for a single file (one retail-sync session per receipt).
  */
-function uploadReceiptToInbox(token, blob) {
-  var syncId = createRetailSync(token);
-  uploadReceiptFile(token, syncId, blob);
-  return startRetailSync(token, syncId);
+function uploadReceiptToInbox(blob) {
+  var syncId = createRetailSync();
+  uploadReceiptFile(syncId, blob);
+  return startRetailSync(syncId);
 }
 
 // ---------- Monarch API calls ----------
 
 /** Step 1: create a bulk retail sync session (count: 1) -> returns sync id. */
-function createRetailSync(token) {
+function createRetailSync() {
   var query =
     'mutation Common_CreateBulkRetailSync($input: CreateBulkRetailSyncInput!) {' +
     '  createBulkRetailSync(input: $input) {' +
@@ -111,7 +125,7 @@ function createRetailSync(token) {
     '    errors { fieldErrors { field messages } message code }' +
     '  }' +
     '}';
-  var data = monarchGraphQL(token, 'Common_CreateBulkRetailSync', query, { input: { count: 1 } });
+  var data = monarchGraphQL('Common_CreateBulkRetailSync', query, { input: { count: 1 } });
   var result = data.createBulkRetailSync || {};
   var syncs = result.retailSyncs || [];
   var errors = result.errors || [];
@@ -122,7 +136,7 @@ function createRetailSync(token) {
 }
 
 /** Step 2: POST the file as multipart/form-data to the sync's files endpoint. */
-function uploadReceiptFile(token, syncId, blob) {
+function uploadReceiptFile(syncId, blob) {
   var mime = blob.getContentType() || 'application/octet-stream';
   var metadata = JSON.stringify({
     orderId: Utilities.getUuid(),
@@ -135,11 +149,7 @@ function uploadReceiptFile(token, syncId, blob) {
   // Do NOT set Content-Type here (the endpoint rejects an explicit content type).
   var resp = UrlFetchApp.fetch(MM_BASE + '/retail-sync/' + syncId + '/files', {
     method: 'post',
-    headers: {
-      'Authorization': 'Token ' + token,
-      'User-Agent': USER_AGENT,
-      'Origin': 'https://app.monarch.com'
-    },
+    headers: cookieHeaders_(false),
     payload: {
       'payloads_count': '1',
       'metadata_0': metadata,
@@ -150,12 +160,12 @@ function uploadReceiptFile(token, syncId, blob) {
 
   var code = resp.getResponseCode();
   if (code !== 200 && code !== 201 && code !== 204) {
-    throw new Error('File upload failed (' + code + '): ' + resp.getContentText());
+    throw new Error('File upload failed (' + code + '): ' + snippet_(resp.getContentText()));
   }
 }
 
 /** Step 3: start the sync so Monarch's AI processes the uploaded receipt. */
-function startRetailSync(token, syncId) {
+function startRetailSync(syncId) {
   var query =
     'mutation Common_StartRetailSync($syncId: ID!) {' +
     '  startRetailSync(id: $syncId) {' +
@@ -163,7 +173,7 @@ function startRetailSync(token, syncId) {
     '    errors { fieldErrors { field messages } message code }' +
     '  }' +
     '}';
-  var data = monarchGraphQL(token, 'Common_StartRetailSync', query, { syncId: syncId });
+  var data = monarchGraphQL('Common_StartRetailSync', query, { syncId: syncId });
   var result = data.startRetailSync || {};
   var errors = result.errors || [];
   if (errors.length) {
@@ -172,136 +182,89 @@ function startRetailSync(token, syncId) {
   return result.retailSync;
 }
 
-// ---------- Auth + helpers ----------
-
-/** Log in (with MFA TOTP if configured) and cache the long-lived token. */
-function monarchLogin() {
-  var props = PropertiesService.getScriptProperties();
-  var cached = props.getProperty('MONARCH_TOKEN');
-  var exp = props.getProperty('MONARCH_TOKEN_EXP');
-  if (cached && exp && Number(exp) > Date.now()) {
-    return cached;
-  }
-
-  var data = {
-    username: CONFIG.email,
-    password: CONFIG.password,
-    supports_mfa: true,
-    trusted_device: true
-  };
-  if (CONFIG.mfaSecret) {
-    data.totp = generateTOTP(CONFIG.mfaSecret);
-  }
-
-  var resp = UrlFetchApp.fetch(MM_BASE + '/auth/login/', {
-    method: 'post',
-    contentType: 'application/json',
-    headers: {
-      'Accept': 'application/json',
-      'Client-Platform': 'web',
-      'User-Agent': USER_AGENT
-    },
-    payload: JSON.stringify(data),
-    muteHttpExceptions: true
-  });
-
-  var code = resp.getResponseCode();
-  var body = resp.getContentText();
-
-  if (code === 403) {
-    throw new Error('Login blocked (MFA required/CAPTCHA). Check your mfaSecret. Response: ' + body);
-  }
-  if (code !== 200) {
-    throw new Error('Login failed (' + code + '): ' + body);
-  }
-
-  var json = JSON.parse(body);
-  var token = json.token;
-  if (!token) {
-    throw new Error('Login succeeded but no token returned: ' + body);
-  }
-
-  // Cache the token to avoid logging in on every run (reduces CAPTCHA risk).
-  props.setProperty('MONARCH_TOKEN', token);
-  props.setProperty('MONARCH_TOKEN_EXP', String(Date.now() + 12 * 3600 * 1000));
-  return token;
-}
-
-/** Generic authenticated GraphQL call against Monarch. */
-function monarchGraphQL(token, operationName, query, variables) {
+/** Generic cookie-authenticated GraphQL call against Monarch. */
+function monarchGraphQL(operationName, query, variables) {
+  var headers = cookieHeaders_(true);
   var resp = UrlFetchApp.fetch(MM_BASE + '/graphql', {
     method: 'post',
     contentType: 'application/json',
-    headers: {
-      'Accept': 'application/json',
-      'Authorization': 'Token ' + token,
-      'Client-Platform': 'web',
-      'User-Agent': USER_AGENT,
-      'Origin': 'https://app.monarch.com'
-    },
-    payload: JSON.stringify({ operationName: operationName, query: query, variables: variables }),
+    headers: headers,
+    payload: JSON.stringify({ operationName: operationName, query: query, variables: variables || {} }),
     muteHttpExceptions: true
   });
 
   var code = resp.getResponseCode();
   var body = resp.getContentText();
+  if (code === 403 && /cloudflare|attention required|you have been blocked/i.test(body)) {
+    throw new Error('Cloudflare blocked the request from Google\'s servers. The cookie approach ' +
+                    'cannot get past Cloudflare from this IP; this script can\'t run from Apps Script.');
+  }
+  if (code === 401 || code === 403) {
+    throw new Error('Auth rejected (' + code + '). Your cookies are likely expired — re-copy a ' +
+                    'fresh cookie string from your browser. Body: ' + snippet_(body));
+  }
   if (code !== 200) {
-    throw new Error('GraphQL ' + operationName + ' failed (' + code + '): ' + body);
+    throw new Error('GraphQL ' + (operationName || '') + ' failed (' + code + '): ' + snippet_(body));
   }
   var json = JSON.parse(body);
   if (json.errors) {
-    throw new Error('GraphQL ' + operationName + ' errors: ' + JSON.stringify(json.errors));
+    throw new Error('GraphQL ' + (operationName || '') + ' errors: ' + JSON.stringify(json.errors));
   }
   return json.data;
 }
 
-/** RFC 6238 TOTP (6 digits, SHA-1, 30s) from a base32 secret. */
-function generateTOTP(secret) {
-  var key = base32ToBytes(secret);
-  var counter = Math.floor((Date.now() / 1000) / 30);
+// ---------- Cookie auth helpers ----------
 
-  // 8-byte big-endian counter
-  var msg = [0, 0, 0, 0, 0, 0, 0, 0];
-  for (var i = 7; i >= 0; i--) {
-    msg[i] = counter & 0xff;
-    counter = Math.floor(counter / 256);
+/** Build request headers for cookie-based auth. jsonBody=true adds JSON Accept/Content. */
+function cookieHeaders_(jsonBody) {
+  var headers = {
+    'Cookie': CONFIG.monarchCookie,
+    'X-Csrftoken': getCsrfToken_(CONFIG.monarchCookie),
+    'Client-Platform': 'web',
+    'User-Agent': CONFIG.userAgent,
+    'Origin': 'https://app.monarch.com',
+    'Referer': 'https://app.monarch.com/',
+    'monarch-client': 'web',
+    'monarch-client-version': '2025.05'
+  };
+  if (jsonBody) {
+    headers['Accept'] = 'application/json';
+    // Content-Type is set via the fetch `contentType` option for JSON calls.
   }
-  var signedMsg = msg.map(function (b) { return b > 127 ? b - 256 : b; });
-
-  var hmac = Utilities.computeHmacSignature(Utilities.MacAlgorithm.HMAC_SHA_1, signedMsg, key);
-  var h = hmac.map(function (b) { return b < 0 ? b + 256 : b; });
-
-  var offset = h[19] & 0xf;
-  var bin = ((h[offset] & 0x7f) << 24) |
-            ((h[offset + 1] & 0xff) << 16) |
-            ((h[offset + 2] & 0xff) << 8) |
-            (h[offset + 3] & 0xff);
-  var otp = bin % 1000000;
-  return ('000000' + otp).slice(-6);
+  // For multipart uploads we deliberately omit Accept and Content-Type (Monarch rejects them).
+  return headers;
 }
 
-/** Decode a base32 string into a (signed) byte array for Apps Script HMAC. */
-function base32ToBytes(base32) {
-  var alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
-  var cleaned = base32.replace(/=+$/, '').replace(/\s/g, '').toUpperCase();
-  var bits = 0, value = 0, bytes = [];
-  for (var i = 0; i < cleaned.length; i++) {
-    var idx = alphabet.indexOf(cleaned.charAt(i));
-    if (idx === -1) continue;
-    value = (value << 5) | idx;
-    bits += 5;
-    if (bits >= 8) {
-      bits -= 8;
-      var b = (value >>> bits) & 0xff;
-      bytes.push(b > 127 ? b - 256 : b);
-    }
+/** Extract the csrftoken value from a cookie header string. */
+function getCsrfToken_(cookieStr) {
+  var m = /(?:^|;\s*)csrftoken=([^;]+)/.exec(cookieStr || '');
+  if (!m) {
+    throw new Error('csrftoken not found in CONFIG.monarchCookie. Copy the FULL cookie header ' +
+                    'from a logged-in app.monarch.com request.');
   }
-  return bytes;
+  return m[1];
 }
 
-/** Optional: run this once to verify login + clear any stale cached token. */
-function testMonarchLogin() {
-  PropertiesService.getScriptProperties().deleteProperty('MONARCH_TOKEN');
-  var token = monarchLogin();
-  Logger.log('Login OK. Token starts with: ' + token.substring(0, 6) + '...');
+function requireCookie_() {
+  if (!CONFIG.monarchCookie || CONFIG.monarchCookie.indexOf('PASTE_FULL') === 0) {
+    throw new Error('Set CONFIG.monarchCookie to your browser cookie string first.');
+  }
+  getCsrfToken_(CONFIG.monarchCookie); // validate session_id/csrftoken presence
+  if (!/(?:^|;\s*)session_id=/.test(CONFIG.monarchCookie)) {
+    throw new Error('session_id not found in CONFIG.monarchCookie.');
+  }
+}
+
+function snippet_(text) {
+  if (!text) return '';
+  text = String(text).replace(/\s+/g, ' ').trim();
+  return text.length > 300 ? text.substring(0, 300) + '…' : text;
+}
+
+/** Run this once to confirm your cookies authenticate (and aren't Cloudflare-blocked). */
+function testMonarchAuth() {
+  requireCookie_();
+  // Minimal query that any authenticated session can answer.
+  var data = monarchGraphQL(null, 'query { __typename }', {});
+  Logger.log('Auth OK. Server responded: ' + JSON.stringify(data));
 }
