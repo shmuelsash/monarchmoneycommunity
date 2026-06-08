@@ -268,7 +268,7 @@ function generateTOTP(secret) {
   }
   var signedMsg = msg.map(function (b) { return b > 127 ? b - 256 : b; });
 
-  var hmac = Utilities.computeHmacSha1Signature(signedMsg, key);
+  var hmac = Utilities.computeHmacSignature(Utilities.MacAlgorithm.HMAC_SHA_1, signedMsg, key);
   var h = hmac.map(function (b) { return b < 0 ? b + 256 : b; });
 
   var offset = h[19] & 0xf;
